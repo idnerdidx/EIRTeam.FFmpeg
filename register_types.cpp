@@ -43,6 +43,10 @@
 
 Ref<VideoStreamFFMpegLoader> ffmpeg_loader;
 
+// idx: print_codecs() dumped one line per supported codec (hundreds of lines)
+// into every startup log. The whole definition is compiled out alongside its
+// only call site below so -Wall stays free of -Wunused-function noise.
+#if 0
 static void print_codecs() {
 	const AVCodecDescriptor *desc = NULL;
 	char msg[512] = { 0 };
@@ -69,12 +73,12 @@ static void print_codecs() {
 		}
 	}
 }
+#endif
 
 void initialize_ffmpeg_module(ModuleInitializationLevel p_level) {
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
 		return;
 	}
-	print_codecs();
 
 #if defined(ENABLE_STREAM_INFO) && !defined(GDEXTENSION)
 	GDREGISTER_CLASS(FFmpegStreamInfo);
