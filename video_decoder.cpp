@@ -184,12 +184,12 @@ Error VideoDecoder::recreate_codec_context() {
 		return ERR_BUG;
 	}
 
-	AVCodecParameters codec_params = *video_stream->codecpar;
+	const AVCodecParameters *codec_params = video_stream->codecpar;
 	// YUV conversion needs rendering device
 	bool has_rendering_device = RenderingServer::get_singleton()->get_rendering_device() != nullptr;
-	bool is_yuv_pixel_fmt = codec_params.format == AVPixelFormat::AV_PIX_FMT_YUV420P || codec_params.format == AVPixelFormat::AV_PIX_FMT_YUVA420P;
+	bool is_yuv_pixel_fmt = codec_params->format == AVPixelFormat::AV_PIX_FMT_YUV420P || codec_params->format == AVPixelFormat::AV_PIX_FMT_YUVA420P;
 	if (is_yuv_pixel_fmt && has_rendering_device) {
-		frame_format = codec_params.format == AVPixelFormat::AV_PIX_FMT_YUV420P ? FFmpegFrameFormat::YUV420P : FFmpegFrameFormat::YUVA420P;
+		frame_format = codec_params->format == AVPixelFormat::AV_PIX_FMT_YUV420P ? FFmpegFrameFormat::YUV420P : FFmpegFrameFormat::YUVA420P;
 	} else {
 		frame_format = FFmpegFrameFormat::RGBA8;
 	}
@@ -206,7 +206,7 @@ Error VideoDecoder::recreate_codec_context() {
 
 	ERR_FAIL_COND_V_MSG(video_codec_context == nullptr, FAILED, vformat("Couldn't allocate codec context: %s", decoder->name));
 
-	int param_copy_result = avcodec_parameters_to_context(video_codec_context, &codec_params);
+	int param_copy_result = avcodec_parameters_to_context(video_codec_context, codec_params);
 
 	ERR_FAIL_COND_V_MSG(param_copy_result < 0, FAILED, vformat("Couldn't copy codec parameters from %s: %s", decoder->name, ffmpeg_get_error_message(param_copy_result)));
 
@@ -217,14 +217,14 @@ Error VideoDecoder::recreate_codec_context() {
 
 	print_line("Succesfully initialized video decoder:", decoder->long_name);
 
-	ERR_FAIL_COND_V_MSG(video_codec_context == nullptr, ERR_CANT_CREATE, vformat("Error creating video codec context: Exhausted all available decoders for codec %s", avcodec_get_name(codec_params.codec_id)));
+	ERR_FAIL_COND_V_MSG(video_codec_context == nullptr, ERR_CANT_CREATE, vformat("Error creating video codec context: Exhausted all available decoders for codec %s", avcodec_get_name(codec_params->codec_id)));
 
 	if (!audio_stream) {
 		return OK;
 	}
 
-	codec_params = *audio_stream->codecpar;
-	const AVCodec *codec = avcodec_find_decoder(codec_params.codec_id);
+	codec_params = audio_stream->codecpar;
+	const AVCodec *codec = avcodec_find_decoder(codec_params->codec_id);
 	if (codec) {
 		if (audio_codec_context != nullptr) {
 			avcodec_free_context(&audio_codec_context);
