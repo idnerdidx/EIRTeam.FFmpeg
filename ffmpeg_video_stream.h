@@ -97,6 +97,59 @@ class FFmpegVideoStreamPlayback : public VideoStreamPlayback {
 	GDCLASS(FFmpegVideoStreamPlayback, VideoStreamPlayback);
 
 	const int LENIENCE_BEFORE_SEEK = 2500;
+
+	// Wall-clock presentation lock.
+	// playback_position used to be a per-machine accumulator (playback_position += p_delta), so four
+	// displays playing the same file drifted apart, and the only correction GDScript can make
+	// (stream_position) is a decoder seek i.e. a frame skip or hold - MEASURED, the correction was
+	// itself the jitter, and no band setting beat leaving it alone. Instead derive the shared epoch
+	// from the wall-clock-derived seek the scheduler already issues at clip start:
+	//     anchor = now - target   reduces to the itinerary's own play time,
+	// which is identical on every machine (their system clocks agree within ~3ms). Position then
+	// becomes a pure function of the shared clock: every display selects the same frame with no
+	// corrections at all, and a machine that stalls CATCHES UP instead of lagging permanently.
+	// Clock RATE recovery, not position jumps.
+	// Every position-based correction tried on this wall made sync WORSE, because writing
+	// playback_position changes which frame is selected and disturbs the decode pipeline - the
+	// correction was itself the jitter, and a jump also re-freezes a fresh error. Instead trim the
+	// RATE of the playback clock by a fraction of a percent so the error decays smoothly over a few
+	// seconds, never skipping or holding a frame. This is standard clock recovery (genlock/broadcast)
+	// and it CONVERGES regardless of when a display started - which is the whole point: staggered and
+	// simultaneous restarts must end up identical.
+	//   err (ms) = shared-schedule target - playback_position   (+ve = this display is behind)
+	//   rate     = 1 + TRIM_GAIN*err, clamped to +/-MAX_TRIM
+	// TRIM_GAIN 0.0012 => a 1-frame (33ms) error asks for 4% rate; MAX_TRIM caps at 5%, so 40ms
+	// converges in <1s. Tightened from 0.0003/2% after telemetry showed one display (the 12GB box)
+	// tracking 20-40ms behind because the loop corrected slower than it accumulated jitter. 5% rate is
+	// imperceptible on video; revisit if these clips ever carry audio. Gross desync still hard-seeks.
+	static constexpr double CLOCK_TRIM_GAIN = 0.0012;
+	static constexpr double CLOCK_MAX_TRIM = 0.05;
+	bool wall_locked = false;
+	double wall_anchor_unix_ms = 0.0;
+	static double now_unix_ms();
+	// PER-STREAM opt-in for wall-clock sync, set from FFmpegVideoStream::wall_clock_sync.
+	// Must be per-stream, not per-process: wall sync makes the clip's position a function of a
+	// shared clock AND takes loop wraps from that clock, so applying it to one-shot content
+	// (trigger stings, non-looping overlays) would wrap them at duration instead of letting
+	// them end - `finished` would never fire and the caller's cleanup would never run.
+	// It also must never be inferred from a seek: `looping` cannot serve as the signal because
+	// it is never assigned anywhere in this repo (a constant false).
+	// Only meaningful for looping content played at 1x.
+	bool wall_sync_opt_in = false;
+	// Separate from the opt-in on purpose. Wall sync (slaving position to the shared clock via
+	// rate trim) is correct for ANY content, one-shot included - it just keeps the screens
+	// together. Taking the LOOP WRAP from that clock is only valid for content that actually
+	// loops: applied to a one-shot clip it seeks back to 0 at duration instead of ending, so
+	// `finished` never fires and the caller never gets to clean up (hide the overlay, clear its
+	// playing flag). Off unless the embedder says the stream loops.
+	bool wall_loop_opt_in = false;
+
+	// Per-instance telemetry state. These were function-local statics, so three simultaneous
+	// playbacks shared ONE 10s window and the lines carried no instance id - two instances
+	// logging different anchors was indistinguishable from a real desync while diagnosing.
+	int sync_log_id = 0;
+	double last_sync_log_ms = 0.0;
+	double last_unlocked_log_ms = 0.0;
 	double playback_position = 0.0f;
 
 	Ref<VideoDecoder> decoder;
@@ -156,13 +209,25 @@ public:
 	STREAM_FUNC_REDIRECT_0_CONST(int, get_mix_rate);
 	STREAM_FUNC_REDIRECT_0_CONST(int, get_channels);
 	FFmpegVideoStreamPlayback();
+	void set_wall_clock_sync(bool p_enabled) { wall_sync_opt_in = p_enabled; }
+	void set_wall_clock_loop(bool p_enabled) { wall_loop_opt_in = p_enabled; }
 };
 
 class FFmpegVideoStream : public VideoStream {
 	GDCLASS(FFmpegVideoStream, VideoStream);
 
+	bool wall_clock_sync = false;
+	bool wall_clock_loop = false;
+
 protected:
-	static void _bind_methods(){}; // Required by GDExtension, do not remove
+	static void _bind_methods() {
+		ClassDB::bind_method(D_METHOD("set_wall_clock_sync", "enabled"), &FFmpegVideoStream::set_wall_clock_sync);
+		ClassDB::bind_method(D_METHOD("is_wall_clock_sync"), &FFmpegVideoStream::is_wall_clock_sync);
+		ADD_PROPERTY(PropertyInfo(Variant::BOOL, "wall_clock_sync"), "set_wall_clock_sync", "is_wall_clock_sync");
+		ClassDB::bind_method(D_METHOD("set_wall_clock_loop", "enabled"), &FFmpegVideoStream::set_wall_clock_loop);
+		ClassDB::bind_method(D_METHOD("is_wall_clock_loop"), &FFmpegVideoStream::is_wall_clock_loop);
+		ADD_PROPERTY(PropertyInfo(Variant::BOOL, "wall_clock_loop"), "set_wall_clock_loop", "is_wall_clock_loop");
+	}
 	Ref<VideoStreamPlayback> instantiate_playback_internal() {
 		Ref<FileAccess> fa = FileAccess::open(get_file(), FileAccess::READ);
 		if (!fa.is_valid()) {
@@ -173,10 +238,16 @@ protected:
 		if (pb->load(fa) != OK) {
 			return nullptr;
 		}
+		pb->set_wall_clock_sync(wall_clock_sync);
+		pb->set_wall_clock_loop(wall_clock_loop);
 		return pb;
 	}
 
 public:
+	void set_wall_clock_sync(bool p_enabled) { wall_clock_sync = p_enabled; }
+	bool is_wall_clock_sync() const { return wall_clock_sync; }
+	void set_wall_clock_loop(bool p_enabled) { wall_clock_loop = p_enabled; }
+	bool is_wall_clock_loop() const { return wall_clock_loop; }
 	STREAM_FUNC_REDIRECT_0(Ref<VideoStreamPlayback>, instantiate_playback);
 };
 

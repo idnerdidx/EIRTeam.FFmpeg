@@ -49,6 +49,72 @@ extern "C" {
 
 const int MAX_PENDING_FRAMES = 3;
 
+namespace {
+
+// Slots per pixel-buffer pool. Only has to be long enough that a slot's Image is
+// normally released before the ring comes round to it again; a miss is not an error,
+// it costs one allocation - which is what EVERY frame cost before the pool existed.
+constexpr int FRAME_POOL_SLOTS = 8;
+
+// A pool of reusable pixel buffers, recycled by ACTUAL LIFETIME rather than by position.
+//
+// Image::create_from_data does not copy - it keeps a copy-on-write reference to the
+// PackedByteArray it is handed. So a buffer whose Image is still alive cannot be written
+// again without ptrw() detaching it, i.e. allocating. A plain round-robin ring assumes
+// the consumer has drained by the time the index wraps, and that is not guaranteed:
+// _read_decoded_frames' receive loop can emit a whole burst of delayed frames in a single
+// call (MAX_PENDING_FRAMES is only checked BEFORE the call, not inside it), so more Images
+// can be live at once than the ring is long. Then every frame silently pays the very
+// allocation the pool exists to avoid, while the comment claims otherwise.
+//
+// acquire() instead asks each slot whether its Image has actually been released, and drops
+// the pool's own reference before returning the buffer, so ptrw() sees a refcount of 1 and
+// writes in place. If every slot is genuinely still in flight it hands back a separate
+// overflow buffer: one allocation, and never a frame rewritten under a live consumer.
+struct FramePool {
+	PackedByteArray bufs[FRAME_POOL_SLOTS];
+	Ref<Image> held[FRAME_POOL_SLOTS];
+	PackedByteArray overflow;
+	int next = 0;
+	int last_acquired = -1;
+
+	PackedByteArray &acquire(int p_size) {
+		for (int i = 0; i < FRAME_POOL_SLOTS; i++) {
+			const int slot = (next + i) % FRAME_POOL_SLOTS;
+			// held[] is the pool's own reference. A count above 1 means someone else - the
+			// playback queue, the on-screen frame - still holds this Image.
+			if (held[slot].is_valid() && held[slot]->get_reference_count() > 1) {
+				continue;
+			}
+			held[slot].unref(); // drop ours; the byte array is now uniquely the pool's
+			next = (slot + 1) % FRAME_POOL_SLOTS;
+			last_acquired = slot;
+			PackedByteArray &buf = bufs[slot];
+			if (buf.size() != p_size) {
+				buf.resize(p_size);
+			}
+			return buf;
+		}
+		last_acquired = -1;
+		// Every slot still in flight. The overflow buffer is shared, so handing it out twice
+		// is safe only because the second ptrw() CoW-detaches it away from the first Image.
+		if (overflow.size() != p_size) {
+			overflow.resize(p_size);
+		}
+		return overflow;
+	}
+
+	// Record the Image built from the last acquire(), so that slot can be recycled once the
+	// consumer lets go of it.
+	void retain(const Ref<Image> &p_image) {
+		if (last_acquired >= 0) {
+			held[last_acquired] = p_image;
+		}
+	}
+};
+
+} // namespace
+
 bool is_hardware_pixel_format(AVPixelFormat p_fmt) {
 	switch (p_fmt) {
 		case AV_PIX_FMT_VDPAU:
@@ -373,7 +439,6 @@ int VideoDecoder::_send_packet(AVCodecContext *p_codec_context, AVFrame *p_recei
 
 void VideoDecoder::_read_decoded_frames(AVFrame *p_received_frame) {
 	Ref<Image> image;
-	PackedByteArray unwrapped_frame;
 	while (true) {
 		ZoneScopedN("Video decoder read decoded frame");
 		int receive_frame_result = avcodec_receive_frame(video_codec_context, p_received_frame);
@@ -412,31 +477,27 @@ void VideoDecoder::_read_decoded_frames(AVFrame *p_received_frame) {
 			continue;
 		}
 
-		// Note: this is the pixel format that the video texture expects internally
-		frame = _ensure_frame_pixel_format(frame, AVPixelFormat::AV_PIX_FMT_RGBA);
-		if (!frame.is_valid()) {
-			continue;
-		}
-
+		// Convert straight into the pooled buffer that becomes the Image.
+		// The previous path ran sws_scale into a padded intermediate AVFrame and then copied
+		// it row-by-row into this buffer - a full width*height*4 copy per frame (33MB at 4K),
+		// which profiling showed as ~50% of the busiest thread (__memmove). sws_scale writes a
+		// packed destination directly, so the intermediate frame and the copy both disappear.
 		ZoneNamedN(image_unwrap, "Image unwrap", true);
-		// Unwrap the image
 		int width = frame->get_frame()->width;
 		int height = frame->get_frame()->height;
 		{
-			ZoneNamedN(image_unwrap_copy, "Image unwrap copy", true);
-
-			int frame_size = frame->get_frame()->buf[0]->size; // Change this if we ever allow RGBA
-			unwrapped_frame.resize(frame_size);
-			uint8_t *unwrapped_frame_ptrw = unwrapped_frame.ptrw();
-			{
-				ZoneNamedN(image_unwrap_memcopy, "memcpy", true);
-				for (int y = 0; y < height; y++) {
-					memcpy(unwrapped_frame_ptrw, frame->get_frame()->data[0] + y * frame->get_frame()->linesize[0], width * 4);
-					unwrapped_frame_ptrw += width * 4;
-				}
+			// See FramePool: recycles by frame lifetime, so a burst of delayed frames from the
+			// receive loop can't hand out a buffer an earlier Image is still reading.
+			static thread_local FramePool rgba_pool;
+			PackedByteArray &pooled_frame = rgba_pool.acquire(width * height * 4);
+			bool scaled = _scale_frame_into(frame, AVPixelFormat::AV_PIX_FMT_RGBA, pooled_frame.ptrw(), width * 4);
+			// _scale_frame_into does not return the frame; we own it either way.
+			frame->do_return();
+			if (!scaled) {
+				continue;
 			}
-			unwrapped_frame.resize(width * height * 4);
-			image = Image::create_from_data(width, height, false, Image::FORMAT_RGBA8, unwrapped_frame);
+			image = Image::create_from_data(width, height, false, Image::FORMAT_RGBA8, pooled_frame);
+			rgba_pool.retain(image);
 		}
 #ifdef FFMPEG_MT_GPU_UPLOAD
 		Ref<ImageTexture> tex;
@@ -517,75 +578,43 @@ void VideoDecoder::_read_decoded_audio_frames(AVFrame *p_received_frame) {
 	}
 }
 
-void VideoDecoder::_scaler_frame_return(Ref<FFmpegFrame> p_scaler_frame) {
-	scaler_frames.push_back(p_scaler_frame);
-}
 
-Ref<FFmpegFrame> VideoDecoder::_ensure_frame_pixel_format(Ref<FFmpegFrame> p_frame, AVPixelFormat p_target_pixel_format) {
-	ZoneScopedN("Video decoder rescale");
-
-	if (p_frame->get_frame()->format == p_target_pixel_format) {
-		return p_frame;
-	}
-
+bool VideoDecoder::_scale_frame_into(Ref<FFmpegFrame> p_frame, AVPixelFormat p_target_pixel_format, uint8_t *p_dst, int p_dst_stride) {
+	ZoneScopedN("Video decoder rescale direct");
 	int width = p_frame->get_frame()->width;
 	int height = p_frame->get_frame()->height;
-
 	sws_context = sws_getCachedContext(
 			sws_context,
 			width, height, (AVPixelFormat)p_frame->get_frame()->format,
 			width, height, p_target_pixel_format,
 			1, nullptr, nullptr, nullptr);
-
-	Ref<FFmpegFrame> scaler_frame;
-	{
-		if (scaler_frames.size() > 0) {
-			scaler_frame = scaler_frames.front()->get();
-			scaler_frames.pop_front();
-		}
-	}
-
-	if (!scaler_frame.is_valid()) {
-		scaler_frame.instantiate();
-		scaler_frame->connect("return_frame", callable_mp(this, &VideoDecoder::_scaler_frame_return));
-	}
-
-	// (re)initialize the scaler frame if needed.
-	if (scaler_frame->get_frame()->format != p_target_pixel_format || scaler_frame->get_frame()->width != width || scaler_frame->get_frame()->height != height) {
-		av_frame_unref(scaler_frame->get_frame());
-
-		// Note: this field determines the scaler's output pix format.
-		scaler_frame->get_frame()->format = p_target_pixel_format;
-		scaler_frame->get_frame()->width = width;
-		scaler_frame->get_frame()->height = height;
-
-		int get_buffer_result = av_frame_get_buffer(scaler_frame->get_frame(), 0);
-
-		if (get_buffer_result < 0) {
-			print_line("Failed to allocate SWS frame buffer:", ffmpeg_get_error_message(get_buffer_result));
-			p_frame->do_return();
-			return Ref<FFmpegFrame>();
-		}
-	}
-
+	uint8_t *dst_planes[4] = { p_dst, nullptr, nullptr, nullptr };
+	int dst_strides[4] = { p_dst_stride, 0, 0, 0 };
 	int scaler_result = sws_scale(
 			sws_context,
 			p_frame->get_frame()->data, p_frame->get_frame()->linesize, 0, height,
-			scaler_frame->get_frame()->data, scaler_frame->get_frame()->linesize);
-
-	// return the original frame regardless of the scaler result.
-	p_frame->do_return();
-
+			dst_planes, dst_strides);
 	if (scaler_result < 0) {
 		print_line("Failed to scale frame:", ffmpeg_get_error_message(scaler_result));
-		return Ref<FFmpegFrame>();
+		return false;
 	}
-
-	return scaler_frame;
+	return true;
 }
 
+
 Ref<DecodedFrame> VideoDecoder::_unwrap_yuv_frame(double p_frame_time, Ref<FFmpegFrame> p_frame, FFmpegFrameFormat p_out_format) {
-	PackedByteArray temp_frame_storage;
+	// One pool PER PLANE, persisted across frames on this decode thread.
+	// The previous form constructed a PackedByteArray per call, resized it to
+	// linesize*height (larger than needed), then resized it AGAIN down to
+	// width*height - so every frame paid two fresh allocations per plane plus the
+	// kernel zeroing those pages. Profiling the saturated thread showed ~50% of it in
+	// __memmove/__memset/kernel_init_pages and the page-fault path, versus 4% in
+	// libswscale.
+	// A single buffer per plane is NOT enough to actually remove those allocations:
+	// Image::create_from_data keeps a copy-on-write reference, and decoded frames stay
+	// queued, so the next frame's ptrw() detaches and allocates anyway. Pool per plane
+	// and recycle on release, exactly as the RGBA path does.
+	static thread_local FramePool plane_pool[4];
 	Ref<DecodedFrame> out_frame = memnew(DecodedFrame(p_frame_time, Ref<Image>()));
 	const int frame_plane_count = p_out_format == FFmpegFrameFormat::YUV420P ? 3 : 4;
 	for (size_t plane_i = 0; plane_i < frame_plane_count; plane_i++) {
@@ -599,18 +628,23 @@ Ref<DecodedFrame> VideoDecoder::_unwrap_yuv_frame(double p_frame_time, Ref<FFmpe
 			height = Math::ceil(height / 2.0f);
 		}
 
-		const int plane_size = p_frame->get_frame()->linesize[plane_i] * height;
-		temp_frame_storage.resize(plane_size);
-		uint8_t *unwrapped_frame_ptrw = temp_frame_storage.ptrw();
+		PackedByteArray &buf = plane_pool[plane_i].acquire(width * height);
+		uint8_t *unwrapped_frame_ptrw = buf.ptrw();
+		const uint8_t *plane_src = p_frame->get_frame()->data[plane_i];
+		// FFmpeg is allowed to hand back a NEGATIVE linesize (a bottom-up plane). The row
+		// offset must therefore stay SIGNED: a size_t cast turns -stride into a huge unsigned
+		// value and the row copy walks off the buffer.
+		const ptrdiff_t plane_stride = p_frame->get_frame()->linesize[plane_i];
 		{
 			ZoneNamedN(yuv_image_unwrap_memcopy, "YUV memcpy", true);
 			for (int y = 0; y < height; y++) {
-				memcpy(unwrapped_frame_ptrw, p_frame->get_frame()->data[plane_i] + y * p_frame->get_frame()->linesize[plane_i], width);
+				memcpy(unwrapped_frame_ptrw, plane_src + (ptrdiff_t)y * plane_stride, width);
 				unwrapped_frame_ptrw += width;
 			}
 		}
-		temp_frame_storage.resize(width * height);
-		out_frame->set_yuv_image_plane(plane_i, Image::create_from_data(width, height, false, Image::FORMAT_R8, temp_frame_storage));
+		Ref<Image> plane_image = Image::create_from_data(width, height, false, Image::FORMAT_R8, buf);
+		plane_pool[plane_i].retain(plane_image);
+		out_frame->set_yuv_image_plane(plane_i, plane_image);
 	}
 
 	out_frame->set_format(p_out_format);
@@ -784,7 +818,6 @@ VideoDecoder::VideoDecoder(Ref<FileAccess> p_file) {
 	video_file = p_file;
 	available_textures_mutex.instantiate();
 	hw_transfer_frames_mutex.instantiate();
-	scaler_frames_mutex.instantiate();
 	decoded_frames_mutex.instantiate();
 	audio_buffer_mutex.instantiate();
 }
