@@ -96,6 +96,15 @@ typedef RD::ComputeListID ComputeListID;
 #else
 #define FREE_RD_RID(rid) RS::get_singleton()->get_rendering_device()->free(rid);
 #endif
+bool FFmpegVideoStreamPlayback::wall_sync_enabled() {
+	static int cached = -1;
+	if (cached < 0) {
+		const char *v = std::getenv("EIRTEAM_FFMPEG_WALL_SYNC");
+		cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+	}
+	return cached == 1;
+}
+
 double FFmpegVideoStreamPlayback::now_unix_ms() {
 	return (double)std::chrono::duration_cast<std::chrono::microseconds>(
 			   std::chrono::system_clock::now().time_since_epoch())
@@ -152,13 +161,11 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 		// Wrap in SHARED-CLOCK terms: advance the anchor a whole duration instead of waiting for
 		// GDScript's replay() to notice the boundary inside a one-frame window (which it can miss).
 		// anchor and duration are identical on every display, so all of them wrap on the same tick.
-		// Only a LOOPING stream wraps. Without this gate a non-looping stream that had been
-		// seeked once restarted from the top forever instead of ending: the wall lock is armed
-		// by any seek, and the wrap does not consult `looping`. A non-looping stream instead
-		// runs target_ms past the duration, the decoder reaches END_OF_STREAM with an empty
-		// queue, and the block below ends playback - which is the ordinary contract.
+		// Reaching here means the embedder opted into wall sync, which is defined for looping
+		// wall content. (This was previously gated on `looping`, which is never assigned in
+		// this repo and therefore disabled the wrap outright.)
 		const double dur_ms = decoder->get_duration();
-		if (looping && dur_ms > 0.0 && target_ms >= dur_ms) {
+		if (dur_ms > 0.0 && target_ms >= dur_ms) {
 			int whole = (int)(target_ms / dur_ms);
 			wall_anchor_unix_ms += whole * dur_ms;
 			target_ms -= whole * dur_ms;
@@ -367,10 +374,12 @@ bool FFmpegVideoStreamPlayback::is_playing_internal() const {
 }
 
 void FFmpegVideoStreamPlayback::set_paused_internal(bool p_paused) {
-	if (paused && !p_paused && wall_locked) {
-		// Resuming: re-anchor so wall time that elapsed while paused is not applied.
-		wall_anchor_unix_ms = now_unix_ms() - playback_position;
-	}
+	// Deliberately does NOT re-anchor on resume. Re-deriving the anchor from the frozen local
+	// position would leave this display exactly the pause duration behind its peers, with the
+	// rate loop seeing zero error and never recovering. Keeping the shared anchor means resume
+	// rejoins the wall: the trim pulls small gaps in, and a long pause exceeds
+	// LENIENCE_BEFORE_SEEK and snaps. A single player that never opted in is unaffected -
+	// wall_locked is false and pause/resume is untouched.
 	paused = p_paused;
 }
 
@@ -389,12 +398,10 @@ void FFmpegVideoStreamPlayback::play_internal() {
 	// itinerary's play time, not a property of this process, so re-entering play() re-derives
 	// the correct shared offset through the wrap branch in update_internal.
 	//
-	// A NON-looping stream has no such wrap to recover through: a stale anchor would make the
-	// first update compute a target far past the duration and end playback instantly. There the
-	// ordinary contract wins - play() means start from the top, free-running.
-	if (!looping) {
-		wall_locked = false;
-	}
+	// No gate is needed here: wall_locked can only ever be set when the embedder opted in, so a
+	// player that did not opt in reaches this with the lock already false and keeps the ordinary
+	// contract. (This was previously `if (!looping) wall_locked = false;` - and because `looping`
+	// is a constant false in this repo, that cleared the lock on EVERY play(), i.e. always.)
 	decoder->seek(0, true);
 	just_seeked = true;
 	playing = true;
@@ -434,8 +441,10 @@ void FFmpegVideoStreamPlayback::seek_internal(double p_time) {
 	// the itinerary play time itself - identical on every display. For an ordinary single
 	// player seeking to 30s the anchor is simply "as if playback had begun 30s ago", which
 	// is what delta accumulation would have produced anyway.
-	wall_anchor_unix_ms = now_unix_ms() - playback_position;
-	wall_locked = true;
+	if (wall_sync_enabled()) {
+		wall_anchor_unix_ms = now_unix_ms() - playback_position;
+		wall_locked = true;
+	}
 }
 
 double FFmpegVideoStreamPlayback::get_length_internal() const {

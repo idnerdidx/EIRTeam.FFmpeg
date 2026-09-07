@@ -128,6 +128,13 @@ class FFmpegVideoStreamPlayback : public VideoStreamPlayback {
 	double wall_anchor_unix_ms = 0.0;
 	double clock_trim = 1.0; // last applied rate, for observability
 	static double now_unix_ms();
+	// Explicit opt-in for wall-clock sync. `looping` CANNOT serve as this signal: it is declared
+	// in both headers and read in several branches but is NEVER ASSIGNED anywhere in this repo,
+	// so it is a constant false - gating on it silently disabled both the sticky lock and the
+	// shared-clock wrap. Wall sync deliberately changes playback semantics (position slaved to a
+	// shared clock, loop wraps taken from that clock, 1x rate assumed), so it must never be
+	// inferred from a seek. Off unless the embedder sets EIRTEAM_FFMPEG_WALL_SYNC.
+	static bool wall_sync_enabled();
 	double playback_position = 0.0f;
 
 	Ref<VideoDecoder> decoder;
