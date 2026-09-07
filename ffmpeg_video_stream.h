@@ -126,15 +126,30 @@ class FFmpegVideoStreamPlayback : public VideoStreamPlayback {
 	static constexpr double CLOCK_MAX_TRIM = 0.05;
 	bool wall_locked = false;
 	double wall_anchor_unix_ms = 0.0;
-	double clock_trim = 1.0; // last applied rate, for observability
 	static double now_unix_ms();
-	// Explicit opt-in for wall-clock sync. `looping` CANNOT serve as this signal: it is declared
-	// in both headers and read in several branches but is NEVER ASSIGNED anywhere in this repo,
-	// so it is a constant false - gating on it silently disabled both the sticky lock and the
-	// shared-clock wrap. Wall sync deliberately changes playback semantics (position slaved to a
-	// shared clock, loop wraps taken from that clock, 1x rate assumed), so it must never be
-	// inferred from a seek. Off unless the embedder sets EIRTEAM_FFMPEG_WALL_SYNC.
-	static bool wall_sync_enabled();
+	// PER-STREAM opt-in for wall-clock sync, set from FFmpegVideoStream::wall_clock_sync.
+	// Must be per-stream, not per-process: wall sync makes the clip's position a function of a
+	// shared clock AND takes loop wraps from that clock, so applying it to one-shot content
+	// (trigger stings, non-looping overlays) would wrap them at duration instead of letting
+	// them end - `finished` would never fire and the caller's cleanup would never run.
+	// It also must never be inferred from a seek: `looping` cannot serve as the signal because
+	// it is never assigned anywhere in this repo (a constant false).
+	// Only meaningful for looping content played at 1x.
+	bool wall_sync_opt_in = false;
+	// Separate from the opt-in on purpose. Wall sync (slaving position to the shared clock via
+	// rate trim) is correct for ANY content, one-shot included - it just keeps the screens
+	// together. Taking the LOOP WRAP from that clock is only valid for content that actually
+	// loops: applied to a one-shot clip it seeks back to 0 at duration instead of ending, so
+	// `finished` never fires and the caller never gets to clean up (hide the overlay, clear its
+	// playing flag). Off unless the embedder says the stream loops.
+	bool wall_loop_opt_in = false;
+
+	// Per-instance telemetry state. These were function-local statics, so three simultaneous
+	// playbacks shared ONE 10s window and the lines carried no instance id - two instances
+	// logging different anchors was indistinguishable from a real desync while diagnosing.
+	int sync_log_id = 0;
+	double last_sync_log_ms = 0.0;
+	double last_unlocked_log_ms = 0.0;
 	double playback_position = 0.0f;
 
 	Ref<VideoDecoder> decoder;
@@ -194,13 +209,25 @@ public:
 	STREAM_FUNC_REDIRECT_0_CONST(int, get_mix_rate);
 	STREAM_FUNC_REDIRECT_0_CONST(int, get_channels);
 	FFmpegVideoStreamPlayback();
+	void set_wall_clock_sync(bool p_enabled) { wall_sync_opt_in = p_enabled; }
+	void set_wall_clock_loop(bool p_enabled) { wall_loop_opt_in = p_enabled; }
 };
 
 class FFmpegVideoStream : public VideoStream {
 	GDCLASS(FFmpegVideoStream, VideoStream);
 
+	bool wall_clock_sync = false;
+	bool wall_clock_loop = false;
+
 protected:
-	static void _bind_methods(){}; // Required by GDExtension, do not remove
+	static void _bind_methods() {
+		ClassDB::bind_method(D_METHOD("set_wall_clock_sync", "enabled"), &FFmpegVideoStream::set_wall_clock_sync);
+		ClassDB::bind_method(D_METHOD("is_wall_clock_sync"), &FFmpegVideoStream::is_wall_clock_sync);
+		ADD_PROPERTY(PropertyInfo(Variant::BOOL, "wall_clock_sync"), "set_wall_clock_sync", "is_wall_clock_sync");
+		ClassDB::bind_method(D_METHOD("set_wall_clock_loop", "enabled"), &FFmpegVideoStream::set_wall_clock_loop);
+		ClassDB::bind_method(D_METHOD("is_wall_clock_loop"), &FFmpegVideoStream::is_wall_clock_loop);
+		ADD_PROPERTY(PropertyInfo(Variant::BOOL, "wall_clock_loop"), "set_wall_clock_loop", "is_wall_clock_loop");
+	}
 	Ref<VideoStreamPlayback> instantiate_playback_internal() {
 		Ref<FileAccess> fa = FileAccess::open(get_file(), FileAccess::READ);
 		if (!fa.is_valid()) {
@@ -211,10 +238,16 @@ protected:
 		if (pb->load(fa) != OK) {
 			return nullptr;
 		}
+		pb->set_wall_clock_sync(wall_clock_sync);
+		pb->set_wall_clock_loop(wall_clock_loop);
 		return pb;
 	}
 
 public:
+	void set_wall_clock_sync(bool p_enabled) { wall_clock_sync = p_enabled; }
+	bool is_wall_clock_sync() const { return wall_clock_sync; }
+	void set_wall_clock_loop(bool p_enabled) { wall_clock_loop = p_enabled; }
+	bool is_wall_clock_loop() const { return wall_clock_loop; }
 	STREAM_FUNC_REDIRECT_0(Ref<VideoStreamPlayback>, instantiate_playback);
 };
 

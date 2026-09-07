@@ -161,8 +161,6 @@ private:
 	List<Ref<ImageTexture>> available_textures;
 	Ref<core_bind::Mutex> hw_transfer_frames_mutex;
 	List<Ref<FFmpegFrame>> hw_transfer_frames;
-	Ref<core_bind::Mutex> scaler_frames_mutex;
-	List<Ref<FFmpegFrame>> scaler_frames;
 	Ref<core_bind::Mutex> decoded_frames_mutex;
 	Vector<Ref<DecodedFrame>> decoded_frames;
 	std::thread *thread = nullptr;
@@ -186,9 +184,7 @@ private:
 	void _read_decoded_audio_frames(AVFrame *p_received_frame);
 
 	void _hw_transfer_frame_return(Ref<FFmpegFrame> p_hw_frame);
-	void _scaler_frame_return(Ref<FFmpegFrame> p_hw_frame);
 
-	Ref<FFmpegFrame> _ensure_frame_pixel_format(Ref<FFmpegFrame> p_frame, AVPixelFormat p_target_pixel_format);
 	// Scale/convert straight into a caller-owned packed buffer (no intermediate AVFrame,
 	// no copy). Does NOT return p_frame to the pool - the caller owns that.
 	bool _scale_frame_into(Ref<FFmpegFrame> p_frame, AVPixelFormat p_target_pixel_format, uint8_t *p_dst, int p_dst_stride);

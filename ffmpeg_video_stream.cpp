@@ -29,6 +29,8 @@
 /**************************************************************************/
 
 #include "ffmpeg_video_stream.h"
+
+#include <chrono>
 #include <iterator>
 
 #ifdef GDEXTENSION
@@ -96,15 +98,6 @@ typedef RD::ComputeListID ComputeListID;
 #else
 #define FREE_RD_RID(rid) RS::get_singleton()->get_rendering_device()->free(rid);
 #endif
-bool FFmpegVideoStreamPlayback::wall_sync_enabled() {
-	static int cached = -1;
-	if (cached < 0) {
-		const char *v = std::getenv("EIRTEAM_FFMPEG_WALL_SYNC");
-		cached = (v && v[0] && v[0] != '0') ? 1 : 0;
-	}
-	return cached == 1;
-}
-
 double FFmpegVideoStreamPlayback::now_unix_ms() {
 	return (double)std::chrono::duration_cast<std::chrono::microseconds>(
 			   std::chrono::system_clock::now().time_since_epoch())
@@ -161,16 +154,15 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 		// Wrap in SHARED-CLOCK terms: advance the anchor a whole duration instead of waiting for
 		// GDScript's replay() to notice the boundary inside a one-frame window (which it can miss).
 		// anchor and duration are identical on every display, so all of them wrap on the same tick.
-		// Reaching here means the embedder opted into wall sync, which is defined for looping
-		// wall content. (This was previously gated on `looping`, which is never assigned in
-		// this repo and therefore disabled the wrap outright.)
+		// Only for content the embedder declared as looping. A one-shot clip must be allowed to
+		// run past duration so END_OF_STREAM ends playback and `finished` fires; wrapping it
+		// here would restart it forever and strand the caller's cleanup.
 		const double dur_ms = decoder->get_duration();
-		if (dur_ms > 0.0 && target_ms >= dur_ms) {
+		if (wall_loop_opt_in && dur_ms > 0.0 && target_ms >= dur_ms) {
 			int whole = (int)(target_ms / dur_ms);
 			wall_anchor_unix_ms += whole * dur_ms;
 			target_ms -= whole * dur_ms;
 			playback_position = target_ms;
-			clock_trim = 1.0;
 			seek_into_sync(); // a real wrap: the decoder has to go back to the start
 			print_line(vformat("SYNC-WRAP anchor=%.1f pos=%.1f dur=%.1f", wall_anchor_unix_ms, playback_position, dur_ms));
 			return;
@@ -179,33 +171,29 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 		if (Math::abs(err_ms) > LENIENCE_BEFORE_SEEK) {
 			// Gross desync (a stall, a clock step): snap, then resume trimming.
 			playback_position = target_ms;
-			clock_trim = 1.0;
 		} else {
 			double rate = 1.0 + CLOCK_TRIM_GAIN * err_ms;
 			rate = CLAMP(rate, 1.0 - CLOCK_MAX_TRIM, 1.0 + CLOCK_MAX_TRIM);
-			clock_trim = rate;
 			playback_position += p_delta * 1000.0 * rate;
 			// Observability: without this the mechanism can only be guessed at from the screen.
 			{
-				static double last_log = 0.0;
 				double now = now_unix_ms();
-				if (now - last_log > 10000.0) {
-					last_log = now;
+				if (now - last_sync_log_ms > 10000.0) {
+					last_sync_log_ms = now;
 					double frame_ms = last_frame.is_valid() ? last_frame->get_time() : -1.0;
-					print_line(vformat("SYNC now=%.1f anchor=%.1f pos=%.1f target=%.1f err=%.1f trim=%.4f shown=%.1f avail=%d",
-							now, wall_anchor_unix_ms, playback_position, target_ms, err_ms, rate, frame_ms, available_frames.size()));
+					print_line(vformat("SYNC[%d] now=%.1f anchor=%.1f pos=%.1f target=%.1f err=%.1f trim=%.4f shown=%.1f avail=%d",
+							sync_log_id, now, wall_anchor_unix_ms, playback_position, target_ms, err_ms, rate, frame_ms, available_frames.size()));
 				}
 			}
 		}
 	} else {
 		playback_position += p_delta * 1000.0f;
 		{
-			static double last_log_u = 0.0;
 			double now = now_unix_ms();
-			if (now - last_log_u > 10000.0) {
-				last_log_u = now;
-				print_line(vformat("SYNC-UNLOCKED pos=%.1f shown=%.1f avail=%d looping=%d",
-						playback_position, last_frame.is_valid() ? last_frame->get_time() : -1.0,
+			if (now - last_unlocked_log_ms > 10000.0) {
+				last_unlocked_log_ms = now;
+				print_line(vformat("SYNC-UNLOCKED[%d] pos=%.1f shown=%.1f avail=%d looping=%d",
+						sync_log_id, playback_position, last_frame.is_valid() ? last_frame->get_time() : -1.0,
 						available_frames.size(), (int)looping));
 			}
 		}
@@ -441,7 +429,7 @@ void FFmpegVideoStreamPlayback::seek_internal(double p_time) {
 	// the itinerary play time itself - identical on every display. For an ordinary single
 	// player seeking to 30s the anchor is simply "as if playback had begun 30s ago", which
 	// is what delta accumulation would have produced anyway.
-	if (wall_sync_enabled()) {
+	if (wall_sync_opt_in) {
 		wall_anchor_unix_ms = now_unix_ms() - playback_position;
 		wall_locked = true;
 	}
@@ -475,6 +463,11 @@ int FFmpegVideoStreamPlayback::get_channels_internal() const {
 }
 
 FFmpegVideoStreamPlayback::FFmpegVideoStreamPlayback() {
+	// Distinguishes the several playbacks a single process runs (background / layers /
+	// trigger) in the SYNC telemetry.
+	static int next_sync_log_id = 0;
+	sync_log_id = ++next_sync_log_id;
+
 }
 
 void FFmpegVideoStreamPlayback::clear() {

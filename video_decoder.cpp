@@ -439,7 +439,6 @@ int VideoDecoder::_send_packet(AVCodecContext *p_codec_context, AVFrame *p_recei
 
 void VideoDecoder::_read_decoded_frames(AVFrame *p_received_frame) {
 	Ref<Image> image;
-	PackedByteArray unwrapped_frame;
 	while (true) {
 		ZoneScopedN("Video decoder read decoded frame");
 		int receive_frame_result = avcodec_receive_frame(video_codec_context, p_received_frame);
@@ -579,9 +578,6 @@ void VideoDecoder::_read_decoded_audio_frames(AVFrame *p_received_frame) {
 	}
 }
 
-void VideoDecoder::_scaler_frame_return(Ref<FFmpegFrame> p_scaler_frame) {
-	scaler_frames.push_back(p_scaler_frame);
-}
 
 bool VideoDecoder::_scale_frame_into(Ref<FFmpegFrame> p_frame, AVPixelFormat p_target_pixel_format, uint8_t *p_dst, int p_dst_stride) {
 	ZoneScopedN("Video decoder rescale direct");
@@ -605,68 +601,6 @@ bool VideoDecoder::_scale_frame_into(Ref<FFmpegFrame> p_frame, AVPixelFormat p_t
 	return true;
 }
 
-Ref<FFmpegFrame> VideoDecoder::_ensure_frame_pixel_format(Ref<FFmpegFrame> p_frame, AVPixelFormat p_target_pixel_format) {
-	ZoneScopedN("Video decoder rescale");
-
-	if (p_frame->get_frame()->format == p_target_pixel_format) {
-		return p_frame;
-	}
-
-	int width = p_frame->get_frame()->width;
-	int height = p_frame->get_frame()->height;
-
-	sws_context = sws_getCachedContext(
-			sws_context,
-			width, height, (AVPixelFormat)p_frame->get_frame()->format,
-			width, height, p_target_pixel_format,
-			1, nullptr, nullptr, nullptr);
-
-	Ref<FFmpegFrame> scaler_frame;
-	{
-		if (scaler_frames.size() > 0) {
-			scaler_frame = scaler_frames.front()->get();
-			scaler_frames.pop_front();
-		}
-	}
-
-	if (!scaler_frame.is_valid()) {
-		scaler_frame.instantiate();
-		scaler_frame->connect("return_frame", callable_mp(this, &VideoDecoder::_scaler_frame_return));
-	}
-
-	// (re)initialize the scaler frame if needed.
-	if (scaler_frame->get_frame()->format != p_target_pixel_format || scaler_frame->get_frame()->width != width || scaler_frame->get_frame()->height != height) {
-		av_frame_unref(scaler_frame->get_frame());
-
-		// Note: this field determines the scaler's output pix format.
-		scaler_frame->get_frame()->format = p_target_pixel_format;
-		scaler_frame->get_frame()->width = width;
-		scaler_frame->get_frame()->height = height;
-
-		int get_buffer_result = av_frame_get_buffer(scaler_frame->get_frame(), 0);
-
-		if (get_buffer_result < 0) {
-			print_line("Failed to allocate SWS frame buffer:", ffmpeg_get_error_message(get_buffer_result));
-			p_frame->do_return();
-			return Ref<FFmpegFrame>();
-		}
-	}
-
-	int scaler_result = sws_scale(
-			sws_context,
-			p_frame->get_frame()->data, p_frame->get_frame()->linesize, 0, height,
-			scaler_frame->get_frame()->data, scaler_frame->get_frame()->linesize);
-
-	// return the original frame regardless of the scaler result.
-	p_frame->do_return();
-
-	if (scaler_result < 0) {
-		print_line("Failed to scale frame:", ffmpeg_get_error_message(scaler_result));
-		return Ref<FFmpegFrame>();
-	}
-
-	return scaler_frame;
-}
 
 Ref<DecodedFrame> VideoDecoder::_unwrap_yuv_frame(double p_frame_time, Ref<FFmpegFrame> p_frame, FFmpegFrameFormat p_out_format) {
 	// One pool PER PLANE, persisted across frames on this decode thread.
@@ -884,7 +818,6 @@ VideoDecoder::VideoDecoder(Ref<FileAccess> p_file) {
 	video_file = p_file;
 	available_textures_mutex.instantiate();
 	hw_transfer_frames_mutex.instantiate();
-	scaler_frames_mutex.instantiate();
 	decoded_frames_mutex.instantiate();
 	audio_buffer_mutex.instantiate();
 }
