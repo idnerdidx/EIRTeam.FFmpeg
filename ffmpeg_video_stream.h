@@ -97,6 +97,42 @@ class FFmpegVideoStreamPlayback : public VideoStreamPlayback {
 	GDCLASS(FFmpegVideoStreamPlayback, VideoStreamPlayback);
 
 	const int LENIENCE_BEFORE_SEEK = 2500;
+	// Corrections smaller than this (ms) are applied WITHOUT a decoder seek or
+	// queue clear - just move the playback clock. Used by the video wall to stay
+	// locked to the shared PTP wall clock without seek thrashing. Well inside
+	// LENIENCE_BEFORE_SEEK so it never fights the out-of-sync hard-seek path.
+	const double SOFT_SEEK_THRESHOLD = 500.0;
+
+	// Wall-clock presentation lock.
+	// playback_position used to be a per-machine accumulator (playback_position += p_delta), so four
+	// displays playing the same file drifted apart, and the only correction GDScript can make
+	// (stream_position) is a decoder seek i.e. a frame skip or hold - MEASURED, the correction was
+	// itself the jitter, and no band setting beat leaving it alone. Instead derive the shared epoch
+	// from the wall-clock-derived seek the scheduler already issues at clip start:
+	//     anchor = now - target   reduces to the itinerary's own play time,
+	// which is identical on every machine (their system clocks agree within ~3ms). Position then
+	// becomes a pure function of the shared clock: every display selects the same frame with no
+	// corrections at all, and a machine that stalls CATCHES UP instead of lagging permanently.
+	// Clock RATE recovery, not position jumps.
+	// Every position-based correction tried on this wall made sync WORSE, because writing
+	// playback_position changes which frame is selected and disturbs the decode pipeline - the
+	// correction was itself the jitter, and a jump also re-freezes a fresh error. Instead trim the
+	// RATE of the playback clock by a fraction of a percent so the error decays smoothly over a few
+	// seconds, never skipping or holding a frame. This is standard clock recovery (genlock/broadcast)
+	// and it CONVERGES regardless of when a display started - which is the whole point: staggered and
+	// simultaneous restarts must end up identical.
+	//   err (ms) = shared-schedule target - playback_position   (+ve = this display is behind)
+	//   rate     = 1 + TRIM_GAIN*err, clamped to +/-MAX_TRIM
+	// TRIM_GAIN 0.0012 => a 1-frame (33ms) error asks for 4% rate; MAX_TRIM caps at 5%, so 40ms
+	// converges in <1s. Tightened from 0.0003/2% after telemetry showed one display (the 12GB box)
+	// tracking 20-40ms behind because the loop corrected slower than it accumulated jitter. 5% rate is
+	// imperceptible on video; revisit if these clips ever carry audio. Gross desync still hard-seeks.
+	static constexpr double CLOCK_TRIM_GAIN = 0.0012;
+	static constexpr double CLOCK_MAX_TRIM = 0.05;
+	bool wall_locked = false;
+	double wall_anchor_unix_ms = 0.0;
+	double clock_trim = 1.0; // last applied rate, for observability
+	static double now_unix_ms();
 	double playback_position = 0.0f;
 
 	Ref<VideoDecoder> decoder;

@@ -96,6 +96,13 @@ typedef RD::ComputeListID ComputeListID;
 #else
 #define FREE_RD_RID(rid) RS::get_singleton()->get_rendering_device()->free(rid);
 #endif
+double FFmpegVideoStreamPlayback::now_unix_ms() {
+	return (double)std::chrono::duration_cast<std::chrono::microseconds>(
+			   std::chrono::system_clock::now().time_since_epoch())
+					   .count() /
+			1000.0;
+}
+
 void FFmpegVideoStreamPlayback::seek_into_sync() {
 	decoder->seek(playback_position);
 	Vector<Ref<DecodedFrame>> decoded_frames;
@@ -139,7 +146,58 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 		return;
 	}
 
-	playback_position += p_delta * 1000.0f;
+	if (wall_locked) {
+		// Rate recovery: never jump, trim the clock so the error decays smoothly.
+		double target_ms = now_unix_ms() - wall_anchor_unix_ms;
+		// Wrap in SHARED-CLOCK terms: advance the anchor a whole duration instead of waiting for
+		// GDScript's replay() to notice the boundary inside a one-frame window (which it can miss).
+		// anchor and duration are identical on every display, so all of them wrap on the same tick.
+		const double dur_ms = decoder->get_duration();
+		if (dur_ms > 0.0 && target_ms >= dur_ms) {
+			int whole = (int)(target_ms / dur_ms);
+			wall_anchor_unix_ms += whole * dur_ms;
+			target_ms -= whole * dur_ms;
+			playback_position = target_ms;
+			clock_trim = 1.0;
+			seek_into_sync(); // a real wrap: the decoder has to go back to the start
+			print_line(vformat("SYNC-WRAP anchor=%.1f pos=%.1f dur=%.1f", wall_anchor_unix_ms, playback_position, dur_ms));
+			return;
+		}
+		const double err_ms = target_ms - playback_position;
+		if (Math::abs(err_ms) > LENIENCE_BEFORE_SEEK) {
+			// Gross desync (a stall, a clock step): snap, then resume trimming.
+			playback_position = target_ms;
+			clock_trim = 1.0;
+		} else {
+			double rate = 1.0 + CLOCK_TRIM_GAIN * err_ms;
+			rate = CLAMP(rate, 1.0 - CLOCK_MAX_TRIM, 1.0 + CLOCK_MAX_TRIM);
+			clock_trim = rate;
+			playback_position += p_delta * 1000.0 * rate;
+			// Observability: without this the mechanism can only be guessed at from the screen.
+			{
+				static double last_log = 0.0;
+				double now = now_unix_ms();
+				if (now - last_log > 10000.0) {
+					last_log = now;
+					double frame_ms = last_frame.is_valid() ? last_frame->get_time() : -1.0;
+					print_line(vformat("SYNC now=%.1f anchor=%.1f pos=%.1f target=%.1f err=%.1f trim=%.4f shown=%.1f avail=%d",
+							now, wall_anchor_unix_ms, playback_position, target_ms, err_ms, rate, frame_ms, available_frames.size()));
+				}
+			}
+		}
+	} else {
+		playback_position += p_delta * 1000.0f;
+		{
+			static double last_log_u = 0.0;
+			double now = now_unix_ms();
+			if (now - last_log_u > 10000.0) {
+				last_log_u = now;
+				print_line(vformat("SYNC-UNLOCKED pos=%.1f shown=%.1f avail=%d looping=%d",
+						playback_position, last_frame.is_valid() ? last_frame->get_time() : -1.0,
+						available_frames.size(), (int)looping));
+			}
+		}
+	}
 
 	if (decoder->get_decoder_state() == VideoDecoder::DecoderState::END_OF_STREAM && available_frames.size() == 0) {
 		// if at the end of the stream but our playback enters a valid time region again, a seek operation is required to get the decoder back on track.
@@ -304,6 +362,10 @@ bool FFmpegVideoStreamPlayback::is_playing_internal() const {
 }
 
 void FFmpegVideoStreamPlayback::set_paused_internal(bool p_paused) {
+	if (paused && !p_paused && wall_locked) {
+		// Resuming: re-anchor so wall time that elapsed while paused is not applied.
+		wall_anchor_unix_ms = now_unix_ms() - playback_position;
+	}
 	paused = p_paused;
 }
 
@@ -314,6 +376,11 @@ void FFmpegVideoStreamPlayback::play_internal() {
 	}
 	clear();
 	playback_position = 0;
+	// NOTE: deliberately does NOT clear wall_locked. Godot re-calls play() on a loop wrap, and
+	// clearing the lock there silently dropped a display back to free-running p_delta for the rest
+	// of the process - which is exactly why restart ORDER used to matter and why the wall split
+	// into locked/unlocked groups 3-4 frames apart. The anchor stays valid: it is the itinerary's
+	// play time, not a property of this process.
 	decoder->seek(0, true);
 	just_seeked = true;
 	playing = true;
@@ -334,11 +401,26 @@ void FFmpegVideoStreamPlayback::stop_internal() {
 }
 
 void FFmpegVideoStreamPlayback::seek_internal(double p_time) {
-	decoder->seek(p_time * 1000.0f);
+	double target_ms = p_time * 1000.0f;
+	// Soft correction: for a small adjustment the target frame is already in (or
+	// adjacent to) the decode queue, so just move the playback clock. The update
+	// loop then advances through buffered frames to catch up, or holds the current
+	// frame to slow down - no decoder seek, no queue clear. This is what lets the
+	// wall run a tight sync band without the seek thrash that clearing the queue
+	// every correction used to cause. Large jumps (loop restart, scrub) still seek.
+	if (Math::abs(target_ms - playback_position) < SOFT_SEEK_THRESHOLD) {
+		playback_position = target_ms;
+		wall_anchor_unix_ms = now_unix_ms() - playback_position;
+		wall_locked = true;
+		return;
+	}
+	decoder->seek(target_ms);
 	just_seeked = true;
 	available_frames.clear();
 	available_audio_frames.clear();
-	playback_position = p_time * 1000.0f;
+	playback_position = target_ms;
+	wall_anchor_unix_ms = now_unix_ms() - playback_position;
+	wall_locked = true;
 }
 
 double FFmpegVideoStreamPlayback::get_length_internal() const {

@@ -412,31 +412,34 @@ void VideoDecoder::_read_decoded_frames(AVFrame *p_received_frame) {
 			continue;
 		}
 
-		// Note: this is the pixel format that the video texture expects internally
-		frame = _ensure_frame_pixel_format(frame, AVPixelFormat::AV_PIX_FMT_RGBA);
-		if (!frame.is_valid()) {
-			continue;
-		}
-
+		// Convert straight into the pooled buffer that becomes the Image.
+		// The previous path ran sws_scale into a padded intermediate AVFrame and then copied
+		// it row-by-row into this buffer - a full width*height*4 copy per frame (33MB at 4K),
+		// which profiling showed as ~50% of the busiest thread (__memmove). sws_scale writes a
+		// packed destination directly, so the intermediate frame and the copy both disappear.
 		ZoneNamedN(image_unwrap, "Image unwrap", true);
-		// Unwrap the image
 		int width = frame->get_frame()->width;
 		int height = frame->get_frame()->height;
 		{
-			ZoneNamedN(image_unwrap_copy, "Image unwrap copy", true);
-
-			int frame_size = frame->get_frame()->buf[0]->size; // Change this if we ever allow RGBA
-			unwrapped_frame.resize(frame_size);
-			uint8_t *unwrapped_frame_ptrw = unwrapped_frame.ptrw();
-			{
-				ZoneNamedN(image_unwrap_memcopy, "memcpy", true);
-				for (int y = 0; y < height; y++) {
-					memcpy(unwrapped_frame_ptrw, frame->get_frame()->data[0] + y * frame->get_frame()->linesize[0], width * 4);
-					unwrapped_frame_ptrw += width * 4;
-				}
+			// Rotating pool: Image::create_from_data takes a copy-on-write REFERENCE, so the
+			// Image owns this buffer until the frame is consumed. MAX_PENDING_FRAMES is 3, so a
+			// pool of 8 is always past the in-flight depth - by the time an entry comes round
+			// again its Image is gone, refcount is 1, and we write in place with no allocation.
+			static thread_local PackedByteArray rgba_pool[8];
+			static thread_local uint32_t rgba_pool_idx = 0;
+			PackedByteArray &pooled_frame = rgba_pool[rgba_pool_idx % 8];
+			rgba_pool_idx++;
+			const int needed_size = width * height * 4;
+			if (pooled_frame.size() != needed_size) {
+				pooled_frame.resize(needed_size);
 			}
-			unwrapped_frame.resize(width * height * 4);
-			image = Image::create_from_data(width, height, false, Image::FORMAT_RGBA8, unwrapped_frame);
+			bool scaled = _scale_frame_into(frame, AVPixelFormat::AV_PIX_FMT_RGBA, pooled_frame.ptrw(), width * 4);
+			// _scale_frame_into does not return the frame; we own it either way.
+			frame->do_return();
+			if (!scaled) {
+				continue;
+			}
+			image = Image::create_from_data(width, height, false, Image::FORMAT_RGBA8, pooled_frame);
 		}
 #ifdef FFMPEG_MT_GPU_UPLOAD
 		Ref<ImageTexture> tex;
@@ -521,6 +524,28 @@ void VideoDecoder::_scaler_frame_return(Ref<FFmpegFrame> p_scaler_frame) {
 	scaler_frames.push_back(p_scaler_frame);
 }
 
+bool VideoDecoder::_scale_frame_into(Ref<FFmpegFrame> p_frame, AVPixelFormat p_target_pixel_format, uint8_t *p_dst, int p_dst_stride) {
+	ZoneScopedN("Video decoder rescale direct");
+	int width = p_frame->get_frame()->width;
+	int height = p_frame->get_frame()->height;
+	sws_context = sws_getCachedContext(
+			sws_context,
+			width, height, (AVPixelFormat)p_frame->get_frame()->format,
+			width, height, p_target_pixel_format,
+			1, nullptr, nullptr, nullptr);
+	uint8_t *dst_planes[4] = { p_dst, nullptr, nullptr, nullptr };
+	int dst_strides[4] = { p_dst_stride, 0, 0, 0 };
+	int scaler_result = sws_scale(
+			sws_context,
+			p_frame->get_frame()->data, p_frame->get_frame()->linesize, 0, height,
+			dst_planes, dst_strides);
+	if (scaler_result < 0) {
+		print_line("Failed to scale frame:", ffmpeg_get_error_message(scaler_result));
+		return false;
+	}
+	return true;
+}
+
 Ref<FFmpegFrame> VideoDecoder::_ensure_frame_pixel_format(Ref<FFmpegFrame> p_frame, AVPixelFormat p_target_pixel_format) {
 	ZoneScopedN("Video decoder rescale");
 
@@ -585,7 +610,15 @@ Ref<FFmpegFrame> VideoDecoder::_ensure_frame_pixel_format(Ref<FFmpegFrame> p_fra
 }
 
 Ref<DecodedFrame> VideoDecoder::_unwrap_yuv_frame(double p_frame_time, Ref<FFmpegFrame> p_frame, FFmpegFrameFormat p_out_format) {
-	PackedByteArray temp_frame_storage;
+	// One reusable buffer PER PLANE, persisted across frames on this decode thread.
+	// The previous form constructed a PackedByteArray per call, resized it to
+	// linesize*height (larger than needed), then resized it AGAIN down to
+	// width*height - so every frame paid two fresh allocations per plane plus the
+	// kernel zeroing those pages. Profiling the saturated thread showed ~50% of it in
+	// __memmove/__memset/kernel_init_pages and the page-fault path, versus 4% in
+	// libswscale. Sizes are constant across frames, so after the first frame these
+	// resize() calls are no-ops and the allocation churn disappears.
+	static thread_local PackedByteArray plane_storage[4];
 	Ref<DecodedFrame> out_frame = memnew(DecodedFrame(p_frame_time, Ref<Image>()));
 	const int frame_plane_count = p_out_format == FFmpegFrameFormat::YUV420P ? 3 : 4;
 	for (size_t plane_i = 0; plane_i < frame_plane_count; plane_i++) {
@@ -599,18 +632,22 @@ Ref<DecodedFrame> VideoDecoder::_unwrap_yuv_frame(double p_frame_time, Ref<FFmpe
 			height = Math::ceil(height / 2.0f);
 		}
 
-		const int plane_size = p_frame->get_frame()->linesize[plane_i] * height;
-		temp_frame_storage.resize(plane_size);
-		uint8_t *unwrapped_frame_ptrw = temp_frame_storage.ptrw();
+		const int needed = width * height;
+		PackedByteArray &buf = plane_storage[plane_i];
+		if (buf.size() != needed) {
+			buf.resize(needed);
+		}
+		uint8_t *unwrapped_frame_ptrw = buf.ptrw();
+		const uint8_t *plane_src = p_frame->get_frame()->data[plane_i];
+		const int plane_stride = p_frame->get_frame()->linesize[plane_i];
 		{
 			ZoneNamedN(yuv_image_unwrap_memcopy, "YUV memcpy", true);
 			for (int y = 0; y < height; y++) {
-				memcpy(unwrapped_frame_ptrw, p_frame->get_frame()->data[plane_i] + y * p_frame->get_frame()->linesize[plane_i], width);
+				memcpy(unwrapped_frame_ptrw, plane_src + (size_t)y * plane_stride, width);
 				unwrapped_frame_ptrw += width;
 			}
 		}
-		temp_frame_storage.resize(width * height);
-		out_frame->set_yuv_image_plane(plane_i, Image::create_from_data(width, height, false, Image::FORMAT_R8, temp_frame_storage));
+		out_frame->set_yuv_image_plane(plane_i, Image::create_from_data(width, height, false, Image::FORMAT_R8, buf));
 	}
 
 	out_frame->set_format(p_out_format);

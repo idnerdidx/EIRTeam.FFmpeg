@@ -189,6 +189,9 @@ private:
 	void _scaler_frame_return(Ref<FFmpegFrame> p_hw_frame);
 
 	Ref<FFmpegFrame> _ensure_frame_pixel_format(Ref<FFmpegFrame> p_frame, AVPixelFormat p_target_pixel_format);
+	// Scale/convert straight into a caller-owned packed buffer (no intermediate AVFrame,
+	// no copy). Does NOT return p_frame to the pool - the caller owns that.
+	bool _scale_frame_into(Ref<FFmpegFrame> p_frame, AVPixelFormat p_target_pixel_format, uint8_t *p_dst, int p_dst_stride);
 	Ref<DecodedFrame> _unwrap_yuv_frame(double p_frame_time, Ref<FFmpegFrame> p_frame, FFmpegFrameFormat p_out_format);
 	AVFrame *_ensure_frame_audio_format(AVFrame *p_frame, AVSampleFormat p_target_audio_format);
 	String _codec_id_to_preferred_decoder_name(AVCodecID p_codec_id) const;
