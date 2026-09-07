@@ -97,11 +97,6 @@ class FFmpegVideoStreamPlayback : public VideoStreamPlayback {
 	GDCLASS(FFmpegVideoStreamPlayback, VideoStreamPlayback);
 
 	const int LENIENCE_BEFORE_SEEK = 2500;
-	// Corrections smaller than this (ms) are applied WITHOUT a decoder seek or
-	// queue clear - just move the playback clock. Used by the video wall to stay
-	// locked to the shared PTP wall clock without seek thrashing. Well inside
-	// LENIENCE_BEFORE_SEEK so it never fights the out-of-sync hard-seek path.
-	const double SOFT_SEEK_THRESHOLD = 500.0;
 
 	// Wall-clock presentation lock.
 	// playback_position used to be a per-machine accumulator (playback_position += p_delta), so four

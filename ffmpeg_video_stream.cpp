@@ -152,8 +152,13 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 		// Wrap in SHARED-CLOCK terms: advance the anchor a whole duration instead of waiting for
 		// GDScript's replay() to notice the boundary inside a one-frame window (which it can miss).
 		// anchor and duration are identical on every display, so all of them wrap on the same tick.
+		// Only a LOOPING stream wraps. Without this gate a non-looping stream that had been
+		// seeked once restarted from the top forever instead of ending: the wall lock is armed
+		// by any seek, and the wrap does not consult `looping`. A non-looping stream instead
+		// runs target_ms past the duration, the decoder reaches END_OF_STREAM with an empty
+		// queue, and the block below ends playback - which is the ordinary contract.
 		const double dur_ms = decoder->get_duration();
-		if (dur_ms > 0.0 && target_ms >= dur_ms) {
+		if (looping && dur_ms > 0.0 && target_ms >= dur_ms) {
 			int whole = (int)(target_ms / dur_ms);
 			wall_anchor_unix_ms += whole * dur_ms;
 			target_ms -= whole * dur_ms;
@@ -376,11 +381,20 @@ void FFmpegVideoStreamPlayback::play_internal() {
 	}
 	clear();
 	playback_position = 0;
-	// NOTE: deliberately does NOT clear wall_locked. Godot re-calls play() on a loop wrap, and
-	// clearing the lock there silently dropped a display back to free-running p_delta for the rest
-	// of the process - which is exactly why restart ORDER used to matter and why the wall split
-	// into locked/unlocked groups 3-4 frames apart. The anchor stays valid: it is the itinerary's
-	// play time, not a property of this process.
+	// The lock is deliberately STICKY while looping. VideoStreamPlayer::play() calls
+	// playback->stop() then playback->play(), and Godot re-enters play() on a loop wrap, so
+	// clearing the lock here dropped a display back to free-running p_delta for the rest of the
+	// process - which is exactly why restart ORDER used to matter and why the wall split into
+	// locked/unlocked groups 3-4 frames apart. The anchor survives on purpose: it is the
+	// itinerary's play time, not a property of this process, so re-entering play() re-derives
+	// the correct shared offset through the wrap branch in update_internal.
+	//
+	// A NON-looping stream has no such wrap to recover through: a stale anchor would make the
+	// first update compute a target far past the duration and end playback instantly. There the
+	// ordinary contract wins - play() means start from the top, free-running.
+	if (!looping) {
+		wall_locked = false;
+	}
 	decoder->seek(0, true);
 	just_seeked = true;
 	playing = true;
@@ -402,23 +416,24 @@ void FFmpegVideoStreamPlayback::stop_internal() {
 
 void FFmpegVideoStreamPlayback::seek_internal(double p_time) {
 	double target_ms = p_time * 1000.0f;
-	// Soft correction: for a small adjustment the target frame is already in (or
-	// adjacent to) the decode queue, so just move the playback clock. The update
-	// loop then advances through buffered frames to catch up, or holds the current
-	// frame to slow down - no decoder seek, no queue clear. This is what lets the
-	// wall run a tight sync band without the seek thrash that clearing the queue
-	// every correction used to cause. Large jumps (loop restart, scrub) still seek.
-	if (Math::abs(target_ms - playback_position) < SOFT_SEEK_THRESHOLD) {
-		playback_position = target_ms;
-		wall_anchor_unix_ms = now_unix_ms() - playback_position;
-		wall_locked = true;
-		return;
-	}
+	// Every seek is a real decoder seek. An earlier revision short-circuited small
+	// adjustments into a bare `playback_position = target` with no decoder seek and no
+	// queue clear, to spare the wall the seek thrash of correcting continuously. That is
+	// no longer needed - update_internal corrects by trimming the clock RATE, which costs
+	// no seek at all - and it was wrong in the backward direction: the retained frame and
+	// the whole decode queue sit at or after the old position, so seeking 10.0s -> 9.6s
+	// held the future frame on screen until the clock caught back up rather than seeking.
+	// stream_position now means what every other VideoStreamPlayback means by it.
 	decoder->seek(target_ms);
 	just_seeked = true;
 	available_frames.clear();
 	available_audio_frames.clear();
 	playback_position = target_ms;
+	// Arm the wall lock and derive the shared epoch from the seek target. For the video
+	// wall the scheduler seeks to `now - itinerary_play_time`, so the anchor reduces to
+	// the itinerary play time itself - identical on every display. For an ordinary single
+	// player seeking to 30s the anchor is simply "as if playback had begun 30s ago", which
+	// is what delta accumulation would have produced anyway.
 	wall_anchor_unix_ms = now_unix_ms() - playback_position;
 	wall_locked = true;
 }

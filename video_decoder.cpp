@@ -49,6 +49,72 @@ extern "C" {
 
 const int MAX_PENDING_FRAMES = 3;
 
+namespace {
+
+// Slots per pixel-buffer pool. Only has to be long enough that a slot's Image is
+// normally released before the ring comes round to it again; a miss is not an error,
+// it costs one allocation - which is what EVERY frame cost before the pool existed.
+constexpr int FRAME_POOL_SLOTS = 8;
+
+// A pool of reusable pixel buffers, recycled by ACTUAL LIFETIME rather than by position.
+//
+// Image::create_from_data does not copy - it keeps a copy-on-write reference to the
+// PackedByteArray it is handed. So a buffer whose Image is still alive cannot be written
+// again without ptrw() detaching it, i.e. allocating. A plain round-robin ring assumes
+// the consumer has drained by the time the index wraps, and that is not guaranteed:
+// _read_decoded_frames' receive loop can emit a whole burst of delayed frames in a single
+// call (MAX_PENDING_FRAMES is only checked BEFORE the call, not inside it), so more Images
+// can be live at once than the ring is long. Then every frame silently pays the very
+// allocation the pool exists to avoid, while the comment claims otherwise.
+//
+// acquire() instead asks each slot whether its Image has actually been released, and drops
+// the pool's own reference before returning the buffer, so ptrw() sees a refcount of 1 and
+// writes in place. If every slot is genuinely still in flight it hands back a separate
+// overflow buffer: one allocation, and never a frame rewritten under a live consumer.
+struct FramePool {
+	PackedByteArray bufs[FRAME_POOL_SLOTS];
+	Ref<Image> held[FRAME_POOL_SLOTS];
+	PackedByteArray overflow;
+	int next = 0;
+	int last_acquired = -1;
+
+	PackedByteArray &acquire(int p_size) {
+		for (int i = 0; i < FRAME_POOL_SLOTS; i++) {
+			const int slot = (next + i) % FRAME_POOL_SLOTS;
+			// held[] is the pool's own reference. A count above 1 means someone else - the
+			// playback queue, the on-screen frame - still holds this Image.
+			if (held[slot].is_valid() && held[slot]->get_reference_count() > 1) {
+				continue;
+			}
+			held[slot].unref(); // drop ours; the byte array is now uniquely the pool's
+			next = (slot + 1) % FRAME_POOL_SLOTS;
+			last_acquired = slot;
+			PackedByteArray &buf = bufs[slot];
+			if (buf.size() != p_size) {
+				buf.resize(p_size);
+			}
+			return buf;
+		}
+		last_acquired = -1;
+		// Every slot still in flight. The overflow buffer is shared, so handing it out twice
+		// is safe only because the second ptrw() CoW-detaches it away from the first Image.
+		if (overflow.size() != p_size) {
+			overflow.resize(p_size);
+		}
+		return overflow;
+	}
+
+	// Record the Image built from the last acquire(), so that slot can be recycled once the
+	// consumer lets go of it.
+	void retain(const Ref<Image> &p_image) {
+		if (last_acquired >= 0) {
+			held[last_acquired] = p_image;
+		}
+	}
+};
+
+} // namespace
+
 bool is_hardware_pixel_format(AVPixelFormat p_fmt) {
 	switch (p_fmt) {
 		case AV_PIX_FMT_VDPAU:
@@ -421,18 +487,10 @@ void VideoDecoder::_read_decoded_frames(AVFrame *p_received_frame) {
 		int width = frame->get_frame()->width;
 		int height = frame->get_frame()->height;
 		{
-			// Rotating pool: Image::create_from_data takes a copy-on-write REFERENCE, so the
-			// Image owns this buffer until the frame is consumed. MAX_PENDING_FRAMES is 3, so a
-			// pool of 8 is always past the in-flight depth - by the time an entry comes round
-			// again its Image is gone, refcount is 1, and we write in place with no allocation.
-			static thread_local PackedByteArray rgba_pool[8];
-			static thread_local uint32_t rgba_pool_idx = 0;
-			PackedByteArray &pooled_frame = rgba_pool[rgba_pool_idx % 8];
-			rgba_pool_idx++;
-			const int needed_size = width * height * 4;
-			if (pooled_frame.size() != needed_size) {
-				pooled_frame.resize(needed_size);
-			}
+			// See FramePool: recycles by frame lifetime, so a burst of delayed frames from the
+			// receive loop can't hand out a buffer an earlier Image is still reading.
+			static thread_local FramePool rgba_pool;
+			PackedByteArray &pooled_frame = rgba_pool.acquire(width * height * 4);
 			bool scaled = _scale_frame_into(frame, AVPixelFormat::AV_PIX_FMT_RGBA, pooled_frame.ptrw(), width * 4);
 			// _scale_frame_into does not return the frame; we own it either way.
 			frame->do_return();
@@ -440,6 +498,7 @@ void VideoDecoder::_read_decoded_frames(AVFrame *p_received_frame) {
 				continue;
 			}
 			image = Image::create_from_data(width, height, false, Image::FORMAT_RGBA8, pooled_frame);
+			rgba_pool.retain(image);
 		}
 #ifdef FFMPEG_MT_GPU_UPLOAD
 		Ref<ImageTexture> tex;
@@ -610,15 +669,18 @@ Ref<FFmpegFrame> VideoDecoder::_ensure_frame_pixel_format(Ref<FFmpegFrame> p_fra
 }
 
 Ref<DecodedFrame> VideoDecoder::_unwrap_yuv_frame(double p_frame_time, Ref<FFmpegFrame> p_frame, FFmpegFrameFormat p_out_format) {
-	// One reusable buffer PER PLANE, persisted across frames on this decode thread.
+	// One pool PER PLANE, persisted across frames on this decode thread.
 	// The previous form constructed a PackedByteArray per call, resized it to
 	// linesize*height (larger than needed), then resized it AGAIN down to
 	// width*height - so every frame paid two fresh allocations per plane plus the
 	// kernel zeroing those pages. Profiling the saturated thread showed ~50% of it in
 	// __memmove/__memset/kernel_init_pages and the page-fault path, versus 4% in
-	// libswscale. Sizes are constant across frames, so after the first frame these
-	// resize() calls are no-ops and the allocation churn disappears.
-	static thread_local PackedByteArray plane_storage[4];
+	// libswscale.
+	// A single buffer per plane is NOT enough to actually remove those allocations:
+	// Image::create_from_data keeps a copy-on-write reference, and decoded frames stay
+	// queued, so the next frame's ptrw() detaches and allocates anyway. Pool per plane
+	// and recycle on release, exactly as the RGBA path does.
+	static thread_local FramePool plane_pool[4];
 	Ref<DecodedFrame> out_frame = memnew(DecodedFrame(p_frame_time, Ref<Image>()));
 	const int frame_plane_count = p_out_format == FFmpegFrameFormat::YUV420P ? 3 : 4;
 	for (size_t plane_i = 0; plane_i < frame_plane_count; plane_i++) {
@@ -632,22 +694,23 @@ Ref<DecodedFrame> VideoDecoder::_unwrap_yuv_frame(double p_frame_time, Ref<FFmpe
 			height = Math::ceil(height / 2.0f);
 		}
 
-		const int needed = width * height;
-		PackedByteArray &buf = plane_storage[plane_i];
-		if (buf.size() != needed) {
-			buf.resize(needed);
-		}
+		PackedByteArray &buf = plane_pool[plane_i].acquire(width * height);
 		uint8_t *unwrapped_frame_ptrw = buf.ptrw();
 		const uint8_t *plane_src = p_frame->get_frame()->data[plane_i];
-		const int plane_stride = p_frame->get_frame()->linesize[plane_i];
+		// FFmpeg is allowed to hand back a NEGATIVE linesize (a bottom-up plane). The row
+		// offset must therefore stay SIGNED: a size_t cast turns -stride into a huge unsigned
+		// value and the row copy walks off the buffer.
+		const ptrdiff_t plane_stride = p_frame->get_frame()->linesize[plane_i];
 		{
 			ZoneNamedN(yuv_image_unwrap_memcopy, "YUV memcpy", true);
 			for (int y = 0; y < height; y++) {
-				memcpy(unwrapped_frame_ptrw, plane_src + (size_t)y * plane_stride, width);
+				memcpy(unwrapped_frame_ptrw, plane_src + (ptrdiff_t)y * plane_stride, width);
 				unwrapped_frame_ptrw += width;
 			}
 		}
-		out_frame->set_yuv_image_plane(plane_i, Image::create_from_data(width, height, false, Image::FORMAT_R8, buf));
+		Ref<Image> plane_image = Image::create_from_data(width, height, false, Image::FORMAT_R8, buf);
+		plane_pool[plane_i].retain(plane_image);
+		out_frame->set_yuv_image_plane(plane_i, plane_image);
 	}
 
 	out_frame->set_format(p_out_format);
