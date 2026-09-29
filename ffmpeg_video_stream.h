@@ -156,9 +156,7 @@ class FFmpegVideoStreamPlayback : public VideoStreamPlayback {
 	List<Ref<DecodedFrame>> available_frames;
 	List<Ref<DecodedAudioFrame>> available_audio_frames;
 	Ref<DecodedFrame> last_frame;
-#ifndef FFMPEG_MT_GPU_UPLOAD
 	Ref<ImageTexture> last_frame_texture;
-#endif
 	Ref<Image> last_frame_image;
 	Ref<ImageTexture> texture;
 	Ref<Texture2DRD> yuv_texture;
