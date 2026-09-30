@@ -755,9 +755,16 @@ void VideoDecoder::return_frames(Vector<Ref<DecodedFrame>> p_frames) {
 }
 
 void VideoDecoder::return_frame(Ref<DecodedFrame> p_frame) {
+#ifdef FFMPEG_MT_GPU_UPLOAD
+	// Only the MT upload path drains this pool; pushing elsewhere grows it by one node per frame.
+	Ref<ImageTexture> texture = p_frame->get_texture();
+	if (texture.is_null()) {
+		return;
+	}
 	available_textures_mutex->lock();
-	available_textures.push_back(p_frame->get_texture());
+	available_textures.push_back(texture);
 	available_textures_mutex->unlock();
+#endif
 }
 
 Vector<Ref<DecodedFrame>> VideoDecoder::get_decoded_frames() {
