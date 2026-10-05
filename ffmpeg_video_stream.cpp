@@ -188,7 +188,9 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 		}
 	} else {
 		playback_position += p_delta * 1000.0f;
-		{
+		// Every playback that is not wall-locked lands here, so log only with --verbose (set at startup).
+		static const bool log_unlocked = is_print_verbose_enabled();
+		if (log_unlocked) {
 			double now = now_unix_ms();
 			if (now - last_unlocked_log_ms > 10000.0) {
 				last_unlocked_log_ms = now;

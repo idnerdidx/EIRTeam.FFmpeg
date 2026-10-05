@@ -32,6 +32,7 @@
 #define GDEX_PRINT_H
 #ifdef GDEXTENSION
 
+#include <godot_cpp/core/print_string.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #define print_line UtilityFunctions::print
