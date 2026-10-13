@@ -58,6 +58,7 @@ using namespace godot;
 
 #include "ffmpeg_codec.h"
 #include "ffmpeg_frame.h"
+#include "packed_frame_scaler.h"
 extern "C" {
 #include "libavformat/avformat.h"
 #include "libswresample/swresample.h"
@@ -136,7 +137,7 @@ private:
 
 	Ref<core_bind::Mutex> audio_buffer_mutex;
 
-	SwsContext *sws_context = nullptr;
+	PackedFrameScaler rgba_scaler;
 	SwrContext *swr_context = nullptr;
 	DecoderState decoder_state = DecoderState::READY;
 	mutable CommandQueueMT decoder_commands;
@@ -185,9 +186,10 @@ private:
 
 	void _hw_transfer_frame_return(Ref<FFmpegFrame> p_hw_frame);
 
-	// Scale/convert straight into a caller-owned packed buffer (no intermediate AVFrame,
-	// no copy). Does NOT return p_frame to the pool - the caller owns that.
-	bool _scale_frame_into(Ref<FFmpegFrame> p_frame, AVPixelFormat p_target_pixel_format, uint8_t *p_dst, int p_dst_stride);
+	// Scale/convert into a caller-owned packed buffer of exactly width * height * bytes per
+	// pixel; see PackedFrameScaler for when that is zero-copy. Does NOT return p_frame to
+	// the pool - the caller owns that.
+	bool _scale_frame_into(Ref<FFmpegFrame> p_frame, AVPixelFormat p_target_pixel_format, int p_bytes_per_pixel, uint8_t *p_dst);
 	Ref<DecodedFrame> _unwrap_yuv_frame(double p_frame_time, Ref<FFmpegFrame> p_frame, FFmpegFrameFormat p_out_format);
 	AVFrame *_ensure_frame_audio_format(AVFrame *p_frame, AVSampleFormat p_target_audio_format);
 	String _codec_id_to_preferred_decoder_name(AVCodecID p_codec_id) const;
