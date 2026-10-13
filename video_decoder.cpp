@@ -477,11 +477,10 @@ void VideoDecoder::_read_decoded_frames(AVFrame *p_received_frame) {
 			continue;
 		}
 
-		// Convert straight into the pooled buffer that becomes the Image.
-		// The previous path ran sws_scale into a padded intermediate AVFrame and then copied
-		// it row-by-row into this buffer - a full width*height*4 copy per frame (33MB at 4K),
-		// which profiling showed as ~50% of the busiest thread (__memmove). sws_scale writes a
-		// packed destination directly, so the intermediate frame and the copy both disappear.
+		// Convert into the pooled buffer that becomes the Image. PackedFrameScaler scales
+		// straight into it for widths that are a multiple of 64 (no intermediate frame, no copy:
+		// that copy was ~50% of the busiest thread at 4K); other widths go through its padded
+		// scratch buffer and a row copy, because sws_scale overruns an exact-size packed buffer.
 		ZoneNamedN(image_unwrap, "Image unwrap", true);
 		int width = frame->get_frame()->width;
 		int height = frame->get_frame()->height;
