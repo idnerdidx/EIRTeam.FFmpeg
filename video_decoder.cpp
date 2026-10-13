@@ -281,7 +281,10 @@ Error VideoDecoder::recreate_codec_context() {
 	int open_codec_result = avcodec_open2(video_codec_context, decoder, nullptr);
 	ERR_FAIL_COND_V_MSG(open_codec_result < 0, FAILED, vformat("Error trying to open %s codec: %s", decoder->name, ffmpeg_get_error_message(open_codec_result)));
 
-	print_line("Succesfully initialized video decoder:", decoder->long_name);
+	// Once per opened video, so on every board load; only with --verbose, like SYNC-UNLOCKED.
+	if (is_print_verbose_enabled()) {
+		print_line("Succesfully initialized video decoder:", decoder->long_name);
+	}
 
 	ERR_FAIL_COND_V_MSG(video_codec_context == nullptr, ERR_CANT_CREATE, vformat("Error creating video codec context: Exhausted all available decoders for codec %s", avcodec_get_name(codec_params->codec_id)));
 
