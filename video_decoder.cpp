@@ -490,7 +490,7 @@ void VideoDecoder::_read_decoded_frames(AVFrame *p_received_frame) {
 			// receive loop can't hand out a buffer an earlier Image is still reading.
 			static thread_local FramePool rgba_pool;
 			PackedByteArray &pooled_frame = rgba_pool.acquire(width * height * 4);
-			bool scaled = _scale_frame_into(frame, AVPixelFormat::AV_PIX_FMT_RGBA, pooled_frame.ptrw(), width * 4);
+			bool scaled = _scale_frame_into(frame, AVPixelFormat::AV_PIX_FMT_RGBA, 4, pooled_frame.ptrw());
 			// _scale_frame_into does not return the frame; we own it either way.
 			frame->do_return();
 			if (!scaled) {
@@ -579,21 +579,9 @@ void VideoDecoder::_read_decoded_audio_frames(AVFrame *p_received_frame) {
 }
 
 
-bool VideoDecoder::_scale_frame_into(Ref<FFmpegFrame> p_frame, AVPixelFormat p_target_pixel_format, uint8_t *p_dst, int p_dst_stride) {
+bool VideoDecoder::_scale_frame_into(Ref<FFmpegFrame> p_frame, AVPixelFormat p_target_pixel_format, int p_bytes_per_pixel, uint8_t *p_dst) {
 	ZoneScopedN("Video decoder rescale direct");
-	int width = p_frame->get_frame()->width;
-	int height = p_frame->get_frame()->height;
-	sws_context = sws_getCachedContext(
-			sws_context,
-			width, height, (AVPixelFormat)p_frame->get_frame()->format,
-			width, height, p_target_pixel_format,
-			1, nullptr, nullptr, nullptr);
-	uint8_t *dst_planes[4] = { p_dst, nullptr, nullptr, nullptr };
-	int dst_strides[4] = { p_dst_stride, 0, 0, 0 };
-	int scaler_result = sws_scale(
-			sws_context,
-			p_frame->get_frame()->data, p_frame->get_frame()->linesize, 0, height,
-			dst_planes, dst_strides);
+	int scaler_result = rgba_scaler.scale(p_frame->get_frame(), p_target_pixel_format, p_bytes_per_pixel, p_dst);
 	if (scaler_result < 0) {
 		print_line("Failed to scale frame:", ffmpeg_get_error_message(scaler_result));
 		return false;
@@ -846,10 +834,6 @@ VideoDecoder::~VideoDecoder() {
 
 	if (audio_codec_context != nullptr) {
 		avcodec_free_context(&audio_codec_context);
-	}
-
-	if (sws_context != nullptr) {
-		sws_freeContext(sws_context);
 	}
 
 	if (swr_context != nullptr) {
