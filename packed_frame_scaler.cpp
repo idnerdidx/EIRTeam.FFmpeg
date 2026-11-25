@@ -47,13 +47,13 @@ bool PackedFrameScaler::scales_directly(int p_width) {
 	return p_width % DIRECT_WIDTH_ALIGN == 0;
 }
 
-int PackedFrameScaler::scale(const AVFrame *p_src, AVPixelFormat p_dst_format, int p_bytes_per_pixel, uint8_t *p_dst) {
+int PackedFrameScaler::scale(const AVFrame *p_src, AVPixelFormat p_dst_format, int p_bytes_per_pixel, uint8_t *p_dst, int p_flags) {
 	const int width = p_src->width;
 	const int height = p_src->height;
 	sws = sws_getCachedContext(sws,
 			width, height, (AVPixelFormat)p_src->format,
 			width, height, p_dst_format,
-			SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+			p_flags, nullptr, nullptr, nullptr);
 	if (sws == nullptr) {
 		return AVERROR(EINVAL);
 	}

@@ -59,6 +59,7 @@ using namespace godot;
 #include "ffmpeg_codec.h"
 #include "ffmpeg_frame.h"
 #include "packed_frame_scaler.h"
+#include "hardware_decoder.h"
 extern "C" {
 #include "libavformat/avformat.h"
 #include "libswresample/swresample.h"
@@ -66,6 +67,7 @@ extern "C" {
 }
 
 #include <thread>
+#include <limits>
 
 String ffmpeg_get_error_message(int p_error_code);
 
@@ -138,6 +140,14 @@ private:
 	Ref<core_bind::Mutex> audio_buffer_mutex;
 
 	PackedFrameScaler rgba_scaler;
+	eirteam::HardwareDecoder hardware_decoder{"file"};
+	bool hardware_decode_failed = false;
+	bool packed_hw_output = false;
+	// Worker-private audio high-water mark. Hardware video replay must not
+	// enqueue the already mixed/queued audio interval a second time.
+	double last_queued_audio_time = -std::numeric_limits<double>::infinity();
+	double replay_audio_through = -std::numeric_limits<double>::infinity();
+	bool replaying_audio = false;
 	SwrContext *swr_context = nullptr;
 	DecoderState decoder_state = DecoderState::READY;
 	mutable CommandQueueMT decoder_commands;
@@ -174,6 +184,8 @@ private:
 	static int64_t _stream_seek_callback(void *p_opaque, int64_t p_offset, int p_whence);
 	void prepare_decoding();
 	Error recreate_codec_context();
+	Error recreate_video_codec_context();
+	bool recover_hardware_failure(AVPacket *packet, AVFrame *frame);
 	static HardwareVideoDecoder from_av_hw_device_type(AVHWDeviceType p_device_type);
 
 	void _seek_command(double p_target_timestamp);
@@ -214,6 +226,7 @@ public:
 	int get_audio_mix_rate() const;
 	int get_audio_channel_count() const;
 	FFmpegFrameFormat get_frame_format() const { return frame_format; }
+	const char *get_decode_path() const { return hardware_decoder.active_path(); }
 
 	VideoDecoder(Ref<FileAccess> p_file);
 	~VideoDecoder();
