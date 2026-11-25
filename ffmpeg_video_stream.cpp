@@ -421,7 +421,10 @@ void FFmpegVideoStreamPlayback::seek_internal(double p_time) {
 	// the whole decode queue sit at or after the old position, so seeking 10.0s -> 9.6s
 	// held the future frame on screen until the clock caught back up rather than seeking.
 	// stream_position now means what every other VideoStreamPlayback means by it.
-	decoder->seek(target_ms);
+	// A completed decoder can still report END_OF_STREAM until its command queue
+	// runs. Wait for the seek before update_internal can mistake that stale state
+	// for the end of this newly requested playback interval.
+	decoder->seek(target_ms, true);
 	just_seeked = true;
 	available_frames.clear();
 	available_audio_frames.clear();

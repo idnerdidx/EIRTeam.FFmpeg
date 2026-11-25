@@ -245,7 +245,7 @@ void VideoDecoder::prepare_decoding() {
 	}
 }
 
-Error VideoDecoder::recreate_codec_context() {
+Error VideoDecoder::recreate_video_codec_context() {
 	if (video_stream == nullptr) {
 		return ERR_BUG;
 	}
@@ -264,22 +264,15 @@ Error VideoDecoder::recreate_codec_context() {
 	if (!decoder) {
 		decoder = avcodec_find_decoder(video_stream->codecpar->codec_id);
 	}
-	if (video_codec_context != nullptr) {
-		avcodec_free_context(&video_codec_context);
-	}
-	video_codec_context = avcodec_alloc_context3(decoder);
-	video_codec_context->pkt_timebase = video_stream->time_base;
-
-	ERR_FAIL_COND_V_MSG(video_codec_context == nullptr, FAILED, vformat("Couldn't allocate codec context: %s", decoder->name));
-
-	int param_copy_result = avcodec_parameters_to_context(video_codec_context, codec_params);
-
-	ERR_FAIL_COND_V_MSG(param_copy_result < 0, FAILED, vformat("Couldn't copy codec parameters from %s: %s", decoder->name, ffmpeg_get_error_message(param_copy_result)));
-
-	video_codec_context->thread_count = 0;
-
-	int open_codec_result = avcodec_open2(video_codec_context, decoder, nullptr);
+	ERR_FAIL_COND_V_MSG(decoder == nullptr, FAILED, "No video decoder available");
+	int open_codec_result = hardware_decoder.open(&video_codec_context, decoder, codec_params, video_stream->time_base);
 	ERR_FAIL_COND_V_MSG(open_codec_result < 0, FAILED, vformat("Error trying to open %s codec: %s", decoder->name, ffmpeg_get_error_message(open_codec_result)));
+	packed_hw_output = packed_hw_output || hardware_decoder.hardware_context(video_codec_context);
+	// Hardware surfaces download as NV12, not planar YUV. Keep the packed upload
+	// contract for this whole playback, including fallback, on every renderer.
+	if (packed_hw_output) {
+		frame_format = FFmpegFrameFormat::RGBA8;
+	}
 
 	// Once per opened video, so on every board load; only with --verbose, like SYNC-UNLOCKED.
 	if (is_print_verbose_enabled()) {
@@ -287,12 +280,20 @@ Error VideoDecoder::recreate_codec_context() {
 	}
 
 	ERR_FAIL_COND_V_MSG(video_codec_context == nullptr, ERR_CANT_CREATE, vformat("Error creating video codec context: Exhausted all available decoders for codec %s", avcodec_get_name(codec_params->codec_id)));
+	return OK;
+}
+
+Error VideoDecoder::recreate_codec_context() {
+	Error result = recreate_video_codec_context();
+	if (result != OK) {
+		return result;
+	}
 
 	if (!audio_stream) {
 		return OK;
 	}
 
-	codec_params = audio_stream->codecpar;
+	const AVCodecParameters *codec_params = audio_stream->codecpar;
 	const AVCodec *codec = avcodec_find_decoder(codec_params->codec_id);
 	if (codec) {
 		if (audio_codec_context != nullptr) {
@@ -313,13 +314,19 @@ Error VideoDecoder::recreate_codec_context() {
 
 void VideoDecoder::_seek_command(double p_target_timestamp) {
 	avcodec_flush_buffers(video_codec_context);
-	av_seek_frame(format_context, video_stream->index, (long)(p_target_timestamp / video_time_base_in_seconds / 1000.0), AVSEEK_FLAG_BACKWARD);
+	int seek_result = av_seek_frame(format_context, video_stream->index, (int64_t)(p_target_timestamp / video_time_base_in_seconds / 1000.0), AVSEEK_FLAG_BACKWARD);
+	if (seek_result < 0) {
+		decoder_state = DecoderState::FAULTED;
+		return;
+	}
 	// No need to seek the audio stream separately since it is seeked automatically with the video stream
 	// due to being in the same file
 	if (has_audio) {
 		avcodec_flush_buffers(audio_codec_context);
 	}
 	skip_output_until_time = p_target_timestamp;
+	last_queued_audio_time = -std::numeric_limits<double>::infinity();
+	replaying_audio = false;
 	decoder_state = DecoderState::READY;
 	skip_current_outputs.clear();
 }
@@ -351,6 +358,8 @@ void VideoDecoder::_thread_func(void *userdata) {
 					OS::get_singleton()->delay_usec(1000);
 				}
 			} break;
+			case FAULTED:
+			case STOPPED:
 			case END_OF_STREAM: {
 				// While at the end of the stream, avoid attempting to read further as this comes with a non-negligible overhead.
 				// A Seek() operation will trigger a state change, allowing decoding to potentially start again.
@@ -390,6 +399,9 @@ void VideoDecoder::_decode_next_frame(AVPacket *p_packet, AVFrame *p_receive_fra
 				codec_ctx = audio_codec_context;
 			}
 			int send_packet_result = _send_packet(codec_ctx, p_receive_frame, p_packet);
+			if (recover_hardware_failure(p_packet, p_receive_frame)) {
+				return;
+			}
 
 			if (send_packet_result == -EAGAIN) {
 				unref_packet = false;
@@ -401,6 +413,9 @@ void VideoDecoder::_decode_next_frame(AVPacket *p_packet, AVFrame *p_receive_fra
 		}
 	} else if (read_frame_result == AVERROR_EOF) {
 		_send_packet(video_codec_context, p_receive_frame, nullptr);
+		if (recover_hardware_failure(p_packet, p_receive_frame)) {
+			return;
+		}
 		if (has_audio) {
 			_send_packet(audio_codec_context, p_receive_frame, nullptr);
 		}
@@ -433,11 +448,39 @@ int VideoDecoder::_send_packet(AVCodecContext *p_codec_context, AVFrame *p_recei
 		} else {
 			_read_decoded_audio_frames(p_receive_frame);
 		}
-	} else if (format_context->streams[p_packet->stream_index]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+	} else if (p_codec_context == video_codec_context && send_packet_result != AVERROR_EOF) {
+		hardware_decode_failed = hardware_decoder.hardware_context(video_codec_context);
 		print_line(vformat("Failed to send avcodec packet: %s", ffmpeg_get_error_message(send_packet_result)));
 	}
 
 	return send_packet_result;
+}
+
+bool VideoDecoder::recover_hardware_failure(AVPacket *packet, AVFrame *frame) {
+	if (!hardware_decode_failed) {
+		return false;
+	}
+	hardware_decode_failed = false;
+	hardware_decoder.demote("decode_or_download_failed");
+	av_packet_unref(packet);
+	av_frame_unref(frame);
+	if (recreate_video_codec_context() != OK) {
+		decoder_state = DecoderState::FAULTED;
+		return true;
+	}
+	// Replay from a preceding keyframe using the normal seek/preroll machinery.
+	// Never feed a mid-GOP packet into a fresh software H264 decoder.
+	const double resume = MAX(0.0, (double)last_decoded_frame_time.get());
+	const double queued_audio = last_queued_audio_time;
+	_seek_command(resume);
+	skip_output_until_time = resume + 0.001; // don't publish the last good frame twice
+	// Keep audio already queued to the main thread and skip its replayed prefix.
+	// Clearing only the worker queue would create a gap; emitting the prefix
+	// again would duplicate audio still held by the playback/mixer.
+	replay_audio_through = queued_audio;
+	last_queued_audio_time = queued_audio;
+	replaying_audio = true;
+	return true;
 }
 
 void VideoDecoder::_read_decoded_frames(AVFrame *p_received_frame) {
@@ -448,17 +491,26 @@ void VideoDecoder::_read_decoded_frames(AVFrame *p_received_frame) {
 
 		if (receive_frame_result < 0) {
 			if (receive_frame_result != -EAGAIN && receive_frame_result != AVERROR_EOF) {
+				hardware_decode_failed = hardware_decoder.hardware_context(video_codec_context);
 				print_line(vformat("Failed to receive frame from avcodec: %s", ffmpeg_get_error_message(receive_frame_result)));
 			}
 
 			break;
 		}
 
+		if (hardware_decoder.download(p_received_frame) < 0) {
+			hardware_decode_failed = hardware_decoder.hardware_context(video_codec_context);
+			av_frame_unref(p_received_frame);
+			break;
+		}
 		// use `best_effort_timestamp` as it can be more accurate if timestamps from the source file (pts) are broken.
 		int64_t frame_timestamp = p_received_frame->best_effort_timestamp != AV_NOPTS_VALUE ? p_received_frame->best_effort_timestamp : p_received_frame->pts;
-		double frame_time = (frame_timestamp - video_stream->start_time) * video_time_base_in_seconds * 1000.0;
+		const int64_t start = video_stream->start_time == AV_NOPTS_VALUE ? 0 : video_stream->start_time;
+		double frame_time = frame_timestamp == AV_NOPTS_VALUE ? (double)last_decoded_frame_time.get() :
+				(frame_timestamp - start) * video_time_base_in_seconds * 1000.0;
 
 		if (skip_output_until_time > frame_time || skip_current_outputs.is_set()) {
+			av_frame_unref(p_received_frame);
 			continue;
 		}
 
@@ -550,7 +602,8 @@ void VideoDecoder::_read_decoded_audio_frames(AVFrame *p_received_frame) {
 		int64_t frame_timestamp = p_received_frame->best_effort_timestamp != AV_NOPTS_VALUE ? p_received_frame->best_effort_timestamp : p_received_frame->pts;
 		double frame_time = (frame_timestamp - audio_stream->start_time) * audio_time_base_in_seconds * 1000.0;
 
-		if (skip_output_until_time > frame_time || skip_current_outputs.is_set()) {
+		if ((replaying_audio ? frame_time <= replay_audio_through : skip_output_until_time > frame_time) || skip_current_outputs.is_set()) {
+			av_frame_unref(p_received_frame);
 			continue;
 		}
 
@@ -570,6 +623,7 @@ void VideoDecoder::_read_decoded_audio_frames(AVFrame *p_received_frame) {
 		audio_buffer_mutex->lock();
 		if (!skip_current_outputs.is_set()) {
 			decoded_audio_frames.push_back(audio_frame);
+			last_queued_audio_time = frame_time;
 		}
 		audio_buffer_mutex->unlock();
 

@@ -189,10 +189,15 @@ private:
 
 protected:
 	void clear();
-	static void _bind_methods(){}; // Required by GDExtension, do not remove
+	static void _bind_methods() {
+		ClassDB::bind_method(D_METHOD("get_decode_path"), &FFmpegVideoStreamPlayback::get_decode_path);
+	}
 
 public:
 	Error load(Ref<FileAccess> p_file_access);
+	String get_decode_path() const {
+		return decoder.is_valid() ? String(decoder->get_decode_path()) : String("unopened");
+	}
 
 	STREAM_FUNC_REDIRECT_0_CONST(bool, is_paused);
 	STREAM_FUNC_REDIRECT_1(void, update, double, p_delta);

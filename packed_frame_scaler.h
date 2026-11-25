@@ -70,7 +70,7 @@ public:
 
 	// p_dst must hold exactly width * height * p_bytes_per_pixel bytes. Returns sws_scale's
 	// result: the output height, or a negative AVERROR.
-	int scale(const AVFrame *p_src, AVPixelFormat p_dst_format, int p_bytes_per_pixel, uint8_t *p_dst);
+	int scale(const AVFrame *p_src, AVPixelFormat p_dst_format, int p_bytes_per_pixel, uint8_t *p_dst, int p_flags = SWS_FAST_BILINEAR);
 
 private:
 	SwsContext *sws = nullptr;
